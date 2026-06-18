@@ -37,6 +37,11 @@ from extraction.profile_smoother import full_smoothing_pipeline
 from geometry.triangulation import LaserTriangulator
 from geometry.seam_features import SeamFeatureExtractor
 from geometry.coordinate_chain import CoordinateChain
+from geometry.boundary_bounding import (
+    compute_plate_presence,
+    build_ridge_indicator,
+    localize_seam_boundaries,
+)
 from pipeline.visualizer import Visualizer
 from pipeline.exporter import PathExporter
 
@@ -126,7 +131,9 @@ class WeldSeamDetector:
             Keys: ``pixel_coords``, ``pixel_coords_classical``,
             ``coords_3d``, ``coords_3d_interval``,
             ``robot_coords``, ``seam_features``, ``fuzzy_result``,
-            ``timing``, ``visualization``.
+            ``timing``, ``visualization``,
+            ``boundary_c_start``, ``boundary_c_end``,
+            ``boundary_env_start``, ``boundary_env_end``.
         """
         timing: Dict[str, float] = {}
 
@@ -152,10 +159,22 @@ class WeldSeamDetector:
             logger.warning("No laser stripe detected in ROI extraction.")
             return {'pixel_coords': None, 'timing': timing}
 
+        # ── Orientation Auto-Detection ──
+        y_spread = np.count_nonzero(np.any(roi_mask, axis=1))
+        x_spread = np.count_nonzero(np.any(roi_mask, axis=0))
+        is_vertical = y_spread > x_spread
+
+        if is_vertical:
+            logger.info("Auto-detected VERTICAL laser orientation. Transposing image for processing.")
+            gray_proc = gray.T
+            roi_mask_proc = roi_mask.T
+        else:
+            gray_proc = gray
+            roi_mask_proc = roi_mask
+
         # ── Stage 2: Fuzzy Processing (dual-path) ──
-        # Pass red-channel grayscale so Steger detects laser ridges, not texture
         t0 = time.perf_counter()
-        fuzzy_result: FuzzyResult = self.fuzzy_pipeline.process(gray, roi_mask)
+        fuzzy_result: FuzzyResult = self.fuzzy_pipeline.process(gray_proc, roi_mask_proc)
         timing['fuzzy_ms'] = (time.perf_counter() - t0) * 1000
 
         if len(fuzzy_result.x_coords) == 0:
@@ -178,7 +197,57 @@ class WeldSeamDetector:
             x_smooth, y_smooth = x_raw.copy(), y_raw.copy()
         timing['smooth_ms'] = (time.perf_counter() - t0) * 1000
 
-        pixel_coords = np.column_stack([x_smooth, y_smooth])
+        # ── Stage 3.5: Geometric Boundary Localization & Truncation ──
+        # Inserted after smoothing and before triangulation so every
+        # downstream consumer (3-D coords, robot coords, seam features)
+        # automatically inherits the corrected, bounded array.
+        t0 = time.perf_counter()
+        c_start_bound: float = float(x_smooth[0]) if len(x_smooth) > 0 else 0.0
+        c_end_bound:   float = float(x_smooth[-1]) if len(x_smooth) > 0 else float(gray_proc.shape[1] - 1)
+        env_start_bound = (c_start_bound,) * 6
+        env_end_bound   = (c_end_bound,)   * 6
+
+        if len(x_smooth) > 6:
+            try:
+                # Build per-column evidence signals
+                effective_mask = (fuzzy_result.membership_map > 0.3).astype(np.uint8)
+                P_mask, P_chroma, _ = compute_plate_presence(
+                    gray_proc,
+                    effective_mask,
+                    expected_stripe_height=self.config.hardware.w_pixels,
+                    bgr=bgr.T if is_vertical else bgr,
+                )
+                P_ridge = build_ridge_indicator(
+                    fuzzy_result.x_coords, gray_proc.shape[1]
+                )
+
+                (
+                    x_smooth, y_smooth,
+                    c_start_bound, c_end_bound,
+                    env_start_bound, env_end_bound,
+                ) = localize_seam_boundaries(
+                    x_smooth, y_smooth,
+                    P_mask, P_ridge,
+                    W=gray_proc.shape[1],
+                    hardware_cfg=self.config.hardware,
+                    Z_ref=self.config.hardware.depth_confidence_z_ref_mm,
+                )
+                logger.info(
+                    "Stage 3.5 boundary bounding: c_start*=%.1f  c_end*=%.1f  "
+                    "(%d points)",
+                    c_start_bound, c_end_bound, len(x_smooth),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Stage 3.5 boundary localization failed (%s) — "
+                    "using full smoothed profile.", exc
+                )
+        timing['boundary_ms'] = (time.perf_counter() - t0) * 1000
+
+        if is_vertical:
+            pixel_coords = np.column_stack([y_smooth, x_smooth])
+        else:
+            pixel_coords = np.column_stack([x_smooth, y_smooth])
 
         # Also smooth classical path for comparison
         pixel_coords_classical = None
@@ -189,7 +258,11 @@ class WeldSeamDetector:
                 x_cl_s, y_cl_s = full_smoothing_pipeline(x_cl, y_cl)
             else:
                 x_cl_s, y_cl_s = x_cl.copy(), y_cl.copy()
-            pixel_coords_classical = np.column_stack([x_cl_s, y_cl_s])
+            
+            if is_vertical:
+                pixel_coords_classical = np.column_stack([y_cl_s, x_cl_s])
+            else:
+                pixel_coords_classical = np.column_stack([x_cl_s, y_cl_s])
 
         # ── Stage 4: 3-D Triangulation ──
         coords_3d = None
@@ -219,14 +292,24 @@ class WeldSeamDetector:
                         len(fuzzy_result.normals_x),
                     )
                     for i in range(n_pts):
-                        p_ridge = np.array([
-                            float(fuzzy_result.x_coords[i]),
-                            float(fuzzy_result.y_centers[i]),
-                        ])
-                        n_hat = np.array([
-                            float(fuzzy_result.normals_x[i]),
-                            float(fuzzy_result.normals_y[i]),
-                        ])
+                        if is_vertical:
+                            p_ridge = np.array([
+                                float(fuzzy_result.y_centers[i]),
+                                float(fuzzy_result.x_coords[i]),
+                            ])
+                            n_hat = np.array([
+                                float(fuzzy_result.normals_y[i]),
+                                float(fuzzy_result.normals_x[i]),
+                            ])
+                        else:
+                            p_ridge = np.array([
+                                float(fuzzy_result.x_coords[i]),
+                                float(fuzzy_result.y_centers[i]),
+                            ])
+                            n_hat = np.array([
+                                float(fuzzy_result.normals_x[i]),
+                                float(fuzzy_result.normals_y[i]),
+                            ])
                         y_c = 0.0  # Ridge is already at center
                         y_l = float(fuzzy_result.y_lower[i] - fuzzy_result.y_centers[i])
                         y_r = float(fuzzy_result.y_upper[i] - fuzzy_result.y_centers[i])
@@ -265,19 +348,26 @@ class WeldSeamDetector:
 
         # ── Stage 5: Visualization ──
         conf = fuzzy_result.confidences
-        if len(conf) > len(x_smooth):
-            conf = conf[:len(x_smooth)]
+        if len(conf) > len(pixel_coords):
+            conf = conf[:len(pixel_coords)]
 
         vis_image = self.visualizer.draw_seam_overlay(
-            image, x_smooth, y_smooth, conf,
+            image, pixel_coords[:, 0], pixel_coords[:, 1], conf,
         )
+
+        if is_vertical:
+            pixel_coords_raw = np.column_stack([
+                fuzzy_result.y_centers, fuzzy_result.x_coords,
+            ])
+        else:
+            pixel_coords_raw = np.column_stack([
+                fuzzy_result.x_coords, fuzzy_result.y_centers,
+            ])
 
         return {
             'pixel_coords': pixel_coords,
             'pixel_coords_classical': pixel_coords_classical,
-            'pixel_coords_raw': np.column_stack([
-                fuzzy_result.x_coords, fuzzy_result.y_centers,
-            ]),
+            'pixel_coords_raw': pixel_coords_raw,
             'coords_3d': coords_3d,
             'coords_3d_interval': coords_3d_interval,
             'robot_coords': robot_coords,
@@ -285,6 +375,11 @@ class WeldSeamDetector:
             'fuzzy_result': fuzzy_result,
             'timing': timing,
             'visualization': vis_image,
+            # Stage 3.5 boundary bounding outputs
+            'boundary_c_start':   c_start_bound,
+            'boundary_c_end':     c_end_bound,
+            'boundary_env_start': env_start_bound,
+            'boundary_env_end':   env_end_bound,
         }
 
     # ------------------------------------------------------------------

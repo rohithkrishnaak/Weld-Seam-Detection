@@ -64,6 +64,39 @@ class ROIExtractor:
     # Public API
     # ------------------------------------------------------------------
 
+    def _to_grayscale(self, image: np.ndarray) -> np.ndarray:
+        """Convert to single-channel using the red channel for a 650 nm laser.
+
+        For a red laser on reflective/wood surfaces, we use R - max(G, B)
+        to suppress broadband bright areas (like wood grain) and isolate
+        pure red light.
+
+        Parameters
+        ----------
+        image : np.ndarray
+            Grayscale ``(H, W)`` or BGR ``(H, W, 3)`` image.
+
+        Returns
+        -------
+        np.ndarray
+            Single-channel image, dtype ``uint8``.
+        """
+        if image.ndim == 2:
+            return image.astype(np.uint8, copy=False)
+
+        if image.ndim == 3 and image.shape[2] == 3:
+            b = image[:, :, 0].astype(np.int16)
+            g = image[:, :, 1].astype(np.int16)
+            r = image[:, :, 2].astype(np.int16)
+            max_bg = np.maximum(b, g)
+            laser_signal = np.clip(r - max_bg, 0, 255).astype(np.uint8)
+            return laser_signal
+
+        raise ValueError(
+            f"Expected grayscale (H, W) or BGR (H, W, 3), "
+            f"got shape {image.shape}"
+        )
+
     def extract_mask(self, image: np.ndarray) -> np.ndarray:
         """Segment the laser stripe and return a binary mask.
 
