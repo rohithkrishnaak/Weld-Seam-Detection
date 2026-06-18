@@ -1,0 +1,27 @@
+{
+    "version": "2.0",
+    "preExecutionHooks": [
+        {
+            "id": "ecc-security-scan",
+            "command": "ecc-agentshield scan --strict",
+            "blockOnFailure": true,
+            "targetPatterns": [
+                "*.py",
+                "*.cpp",
+                "*.hpp"
+            ]
+        }
+    ],
+    "agentConfig": {
+        "routing": "cloud",
+        "defaultModel": "gemini-1.5-pro",
+        "fallbackModel": "claude-3-5-sonnet"
+    },
+    "skills": {
+        "research": ".antigravity/skills/research-first.md",
+        "review": ".antigravity/skills/code-review.md",
+        "resume": ".antigravity/skills/resume-session.md",
+        "vectorize": ".antigravity/skills/python-vectorization.md",
+        "commit": ".antigravity/skills/git-commit-formatter.md"
+    }
+}
