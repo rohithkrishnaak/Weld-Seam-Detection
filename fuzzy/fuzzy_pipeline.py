@@ -93,6 +93,20 @@ class FuzzyResult:
     normals_x: np.ndarray
     normals_y: np.ndarray
 
+    # --- Stage 6.5 inputs (already computed in process(), now exposed) ---
+    strengths: np.ndarray
+    """Per-selected-column Steger ridge strength |eigenval_max|, shape (N,).
+    Same index correspondence as x_coords.  Used as cue 1 in Stage 6.5."""
+
+    profiles: np.ndarray
+    """Cross-ridge intensity profiles, shape (N, M).  Sliceable along axis 0
+    (per column) in truncate_to_seam_bounds.  Axis 1 (per sample) is shared
+    across columns and must NOT be sliced."""
+
+    s_coords: np.ndarray
+    """Spatial offsets along Steger normals, shape (M,).  Shared across all
+    columns — NOT per-column.  truncate_to_seam_bounds leaves this unchanged."""
+
 
 # ======================================================================
 # Pipeline
@@ -384,6 +398,8 @@ class FuzzyPipeline:
         if len(ridge_x) == 0:
             logger.warning("No Steger ridge points — using CoG only.")
             n = len(cog_x)
+            _empty_profiles = np.zeros((n, 1), dtype=np.float64)
+            _empty_s_coords = np.zeros(1, dtype=np.float64)
             return FuzzyResult(
                 x_coords=cog_x.astype(np.int64),
                 y_centers=cog_y.copy(),
@@ -396,6 +412,9 @@ class FuzzyPipeline:
                 membership_map=cleaned_map,
                 normals_x=np.zeros(n, dtype=np.float64),
                 normals_y=np.ones(n, dtype=np.float64),
+                strengths=np.zeros(n, dtype=np.float64),
+                profiles=_empty_profiles,
+                s_coords=_empty_s_coords,
             )
 
         # ── Reduce to one point per column (strongest) ──
@@ -520,4 +539,7 @@ class FuzzyPipeline:
             membership_map=cleaned_map,
             normals_x=sel_nx,
             normals_y=sel_ny,
+            strengths=sel_str,      # Steger ridge strength per selected column
+            profiles=profiles,      # (N, M) cross-ridge profiles; axis-0 sliceable
+            s_coords=s_coords,      # (M,) shared; NOT per-column, NOT sliced
         )

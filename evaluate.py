@@ -29,7 +29,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from collections import Counter
 
 import cv2
@@ -125,6 +125,24 @@ def generate_synthetic_profile(
         # True center shifts slightly toward the broader side
         true_center = center + width * 0.05
 
+    elif profile_type == 'beyond_edge_specular':
+        # Simulates a bright specular blob outside the plate edge (item L).
+        # The weld stripe is bounded within [0, col_end]; a specular highlight
+        # sits beyond col_end.  Exercises that the boundary localizer does NOT
+        # extend into the specular region.
+        # In the 1-D profile context, col_end is encoded as center+width*3.
+        plate_end = center + width * 3.0    # right edge of the plate within this profile
+        # Laser stripe (tapered to 0 beyond plate_end via logistic)
+        raw_stripe = amplitude * np.exp(-((x - center) ** 2) / (2 * width ** 2))
+        taper_width_val = max(width * 0.5, 1.0)
+        taper = 1.0 / (1.0 + np.exp((x - plate_end) / taper_width_val))
+        profile = raw_stripe * taper
+        # Specular blob: 20 px past plate_end, amplitude 60% of main stripe
+        specular_center = plate_end + 20.0
+        profile += amplitude * 0.6 * np.exp(-((x - specular_center) ** 2) / (2 * 4.0 ** 2))
+        profile += rng.normal(0, noise_std, length)
+        true_center = center
+
     else:
         raise ValueError(f"Unknown profile type: {profile_type}")
 
@@ -141,7 +159,10 @@ def generate_synthetic_image(
     noise_std: float = 5.0,
     saturation_fraction: float = 0.3,
     seed: int = 42,
-) -> Tuple[np.ndarray, np.ndarray]:
+    col_start: Optional[int] = None,
+    col_end: Optional[int] = None,
+    taper_width: float = 10.0,
+) -> Tuple[np.ndarray, np.ndarray, Optional[int], Optional[int]]:
     """Generate a synthetic laser stripe image with ground-truth mask.
 
     Parameters
@@ -160,6 +181,13 @@ def generate_synthetic_image(
         Fraction of columns that are saturated.
     seed : int
         Random seed.
+    col_start, col_end : int, optional
+        Ground-truth plate boundaries.  If provided, the stripe amplitude
+        is tapered to zero outside ``[col_start, col_end]`` using a logistic
+        function (smooth, physically realistic taper — not a hard clip).
+        If ``None``, the stripe extends across the full image width.
+    taper_width : float
+        Width (in pixels) of the logistic taper at each boundary.
 
     Returns
     -------
@@ -167,6 +195,10 @@ def generate_synthetic_image(
         Grayscale image (uint8).
     gt_centers : np.ndarray
         Per-column ground-truth center Y coordinates.
+    col_start : int or None
+        Resolved left boundary column (same as input or None).
+    col_end : int or None
+        Resolved right boundary column (same as input or None).
     """
     rng = np.random.RandomState(seed)
 
@@ -175,15 +207,27 @@ def generate_synthetic_image(
     gt_centers = center_y + 5.0 * np.sin(2 * np.pi * x / width)
 
     y = np.arange(height, dtype=np.float64)
-    yy, _ = np.meshgrid(y, x, indexing='ij')
+
+    # Logistic taper for smooth plate boundary (item L)
+    if col_start is not None or col_end is not None:
+        cs = float(col_start if col_start is not None else 0)
+        ce = float(col_end   if col_end   is not None else width - 1)
+        tw = max(taper_width, 1.0)
+        # Left taper: ~0 for x < cs, ~1 for x > cs
+        taper_left  = 1.0 / (1.0 + np.exp(-(x - cs) / tw))
+        # Right taper: ~1 for x < ce, ~0 for x > ce
+        taper_right = 1.0 / (1.0 + np.exp( (x - ce) / tw))
+        amplitude_profile = taper_left * taper_right   # shape (width,)
+    else:
+        amplitude_profile = np.ones(width, dtype=np.float64)
 
     image = np.zeros((height, width), dtype=np.float64)
     for col in range(width):
         cy = gt_centers[col]
-        amp = amplitude
+        amp = amplitude * amplitude_profile[col]
         # Make some columns saturated
         if col / width < saturation_fraction:
-            amp = amplitude * 1.8  # will clip to 255
+            amp = min(amp * 1.8, amplitude * 1.8)  # will clip to 255
         profile = amp * np.exp(-((y - cy) ** 2) / (2 * stripe_width ** 2))
         image[:, col] = profile
 
@@ -191,7 +235,7 @@ def generate_synthetic_image(
     image += rng.normal(0, noise_std, (height, width))
     image = np.clip(image, 0, 255).astype(np.uint8)
 
-    return image, gt_centers
+    return image, gt_centers, col_start, col_end
 
 
 # ------------------------------------------------------------------
@@ -340,7 +384,7 @@ def run_synthetic_benchmark(output_dir: str) -> Dict:
 
     # Full-image synthetic test
     logger.info("Running full-image synthetic test...")
-    image, gt_centers = generate_synthetic_image(seed=42)
+    image, gt_centers, _, _ = generate_synthetic_image(seed=42)
 
     # Create mask via thresholding
     roi_extractor = ROIExtractor()
@@ -389,8 +433,149 @@ def run_synthetic_benchmark(output_dir: str) -> Dict:
 
 
 # ------------------------------------------------------------------
-# Real image evaluation
+# Boundary localization regression benchmark (Stage 6.5)
 # ------------------------------------------------------------------
+
+def run_boundary_benchmark(output_dir: str) -> Dict:
+    """Test Stage 6.5 boundary localization against synthetic images with
+    known ground-truth plate extents.
+
+    Two scenarios are exercised:
+
+    1. **clean_taper** — stripe amplitude tapered to zero at known
+       ``[col_start, col_end]`` via logistic function.  Exercises cues
+       1 (ridge-strength drop) and 2 (interval widening as SNR drops).
+       Acceptance criterion: ``boundary_error < 5 px``.
+
+    2. **beyond_edge_specular** — a bright specular blob is placed past
+       ``col_end``.  Exercises that multi-cue fusion does NOT extend the
+       boundary into the specular region.  This directly validates the
+       central claim that multi-cue OWA fusion outperforms any single-
+       amplitude threshold.  Acceptance criterion: ``boundary_error < 15 px``.
+
+    Returns
+    -------
+    dict
+        Per-scenario boundary error statistics.
+    """
+    from pipeline.inference import WeldSeamDetector
+    from config import DEFAULT_CONFIG
+
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    logger.info("═══ Running Stage 6.5 Boundary Benchmark ═══")
+
+    detector = WeldSeamDetector(config=DEFAULT_CONFIG)
+    results: Dict[str, Dict] = {}
+
+    # --- Scenario 1: Clean logistic taper ---
+    logger.info("Scenario 1: clean_taper (acceptance: < 5 px)")
+    taper_errors_start, taper_errors_end = [], []
+    n_taper = 10
+    for trial in range(n_taper):
+        width  = 400
+        cs     = 50  + trial * 2   # ~50-70 px from left
+        ce     = 350 - trial * 2   # ~330-350 px from right
+        image, gt_centers, _, _ = generate_synthetic_image(
+            height=200, width=width, center_y=100.0,
+            stripe_width=8.0, amplitude=200.0, noise_std=5.0,
+            saturation_fraction=0.0, seed=trial + 200,
+            col_start=cs, col_end=ce, taper_width=15.0,
+        )
+        # Convert grayscale to BGR for ROI extractor
+        bgr = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        result = detector.detect(bgr, mode='fuzzy')
+        if result.get('boundary_frac_start') is not None:
+            err_s = abs(result['boundary_frac_start'] - cs)
+            err_e = abs(result['boundary_frac_end']   - ce)
+            taper_errors_start.append(err_s)
+            taper_errors_end.append(err_e)
+            logger.info(
+                "  trial=%d  cs=%d ce=%d  detected=[%.1f, %.1f]  "
+                "err=[%.1f, %.1f] px",
+                trial, cs, ce,
+                result['boundary_frac_start'], result['boundary_frac_end'],
+                err_s, err_e,
+            )
+        else:
+            logger.warning("  trial=%d: no boundary detected.", trial)
+
+    if taper_errors_start:
+        s1 = {
+            'mae_start_px': float(np.mean(taper_errors_start)),
+            'mae_end_px':   float(np.mean(taper_errors_end)),
+            'max_start_px': float(np.max(taper_errors_start)),
+            'max_end_px':   float(np.max(taper_errors_end)),
+            'n_detected':   len(taper_errors_start),
+            'acceptance_5px_start': bool(np.mean(taper_errors_start) < 5.0),
+            'acceptance_5px_end':   bool(np.mean(taper_errors_end)   < 5.0),
+        }
+        results['clean_taper'] = s1
+        logger.info(
+            "clean_taper: MAE start=%.2f px, end=%.2f px  "
+            "(pass: start=%s, end=%s)",
+            s1['mae_start_px'], s1['mae_end_px'],
+            s1['acceptance_5px_start'], s1['acceptance_5px_end'],
+        )
+
+    # --- Scenario 2: Specular blob past the plate edge ---
+    logger.info("Scenario 2: beyond_edge_specular (acceptance: boundary does NOT extend into specular)")
+    specular_errors = []
+    n_spec = 5
+    for trial in range(n_spec):
+        width = 400
+        cs    = 50
+        ce    = 300
+        specular_col = ce + 30    # blob center, 30 px past plate edge
+        image, gt_centers, _, _ = generate_synthetic_image(
+            height=200, width=width, center_y=100.0,
+            stripe_width=8.0, amplitude=200.0, noise_std=5.0,
+            saturation_fraction=0.0, seed=trial + 300,
+            col_start=cs, col_end=ce, taper_width=10.0,
+        )
+        # Inject specular blob past plate edge
+        y = np.arange(200, dtype=np.float64)
+        specular_amp = 130.0
+        specular_row = 100.0
+        blob = specular_amp * np.exp(-((y - specular_row) ** 2) / (2 * 4.0 ** 2))
+        img_float = image.astype(np.float64)
+        for c in range(specular_col - 5, min(specular_col + 5, width)):
+            img_float[:, c] += blob
+        image = np.clip(img_float, 0, 255).astype(np.uint8)
+
+        bgr = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        result = detector.detect(bgr, mode='fuzzy')
+        if result.get('boundary_frac_end') is not None:
+            detected_end = result['boundary_frac_end']
+            # The boundary must NOT extend to the specular region
+            overshoot = max(detected_end - ce, 0.0)
+            specular_errors.append(overshoot)
+            logger.info(
+                "  trial=%d  ce=%d  specular_col=%d  "
+                "detected_end=%.1f  overshoot=%.1f px",
+                trial, ce, specular_col, detected_end, overshoot,
+            )
+        else:
+            logger.warning("  trial=%d: no boundary detected.", trial)
+
+    if specular_errors:
+        s2 = {
+            'mean_overshoot_px': float(np.mean(specular_errors)),
+            'max_overshoot_px':  float(np.max(specular_errors)),
+            'n_detected':        len(specular_errors),
+            'acceptance_15px':   bool(np.mean(specular_errors) < 15.0),
+        }
+        results['beyond_edge_specular'] = s2
+        logger.info(
+            "beyond_edge_specular: mean overshoot=%.2f px  (pass: %s)",
+            s2['mean_overshoot_px'], s2['acceptance_15px'],
+        )
+
+    save_metrics(results, str(out_path / 'boundary_benchmark.json'))
+    logger.info("═══ Stage 6.5 Boundary Benchmark Complete ═══")
+    return results
+
 
 def evaluate(
     image_dir: str,

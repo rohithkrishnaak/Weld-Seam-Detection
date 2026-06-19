@@ -31,7 +31,7 @@ References:
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 import numpy as np
 
@@ -270,6 +270,105 @@ class PathConfig:
 
 
 # ---------------------------------------------------------------------------
+# Boundary Localization (Stage 6.5)
+# ---------------------------------------------------------------------------
+@dataclass
+class BoundaryConfig:
+    """Parameters for Stage 6.5 along-seam boundary-aware truncation.
+
+    Two Gaussian smoothing scales are used — keep them distinct:
+
+    * ``steger_sigma`` (Optional[float]):  per-profile LoG smoothing scale
+      for the cross-ridge curvature cue (cue 4).  ``None`` means inherit
+      ``HardwareConfig.sigma`` at runtime.  Use ``None`` — **not** ``0.0`` —
+      to request the inherited value; ``0.0`` would skip smoothing entirely.
+
+    * ``edge_smooth_sigma`` (float):  Gaussian applied to the along-seam
+      ``mu_edge`` vector before run-length detection.  Operates along the
+      seam axis (1-D), not across the laser stripe cross-section.
+
+    OWA weight semantics
+    --------------------
+    ``owa_rank_weights[k]`` is applied to the *k-th largest* cue value at
+    each column — NOT to a specific named cue.  This is Yager (1988) OWA.
+    Do **not** assume ``owa_rank_weights[0]`` always maps to ``e_strength``;
+    it maps to whichever cue is largest at that column.
+
+    References
+    ----------
+    [5] Yager, R.R. (1988). On ordered weighted averaging aggregation
+        operators in multicriteria decisionmaking. IEEE Trans. Syst. Man
+        Cybern., 18(1), 183-190.
+    [6] Marr, D. & Hildreth, E. (1980). Theory of edge detection.
+        Proc. R. Soc. Lond. B, 207(1167), 187-217.
+    [7] Canny, J. (1986). A computational approach to edge detection.
+        IEEE TPAMI, 8(6), 679-698.
+    """
+
+    # --- Per-profile curvature cue (LoG, cue 4) ---
+    steger_sigma: Optional[float] = None
+    """Gaussian sigma for profile second-derivative (LoG) curvature cue.
+    None → inherit HardwareConfig.sigma at runtime."""
+
+    zc_ref: float = 2.0
+    """Extra zero-crossings above 2 that saturate e_curvature to 1.0."""
+
+    zc_eta: float = 0.5
+    """Magnitude gate for zero-crossing counting: a crossing is counted
+    only if |d2p| > zc_eta * std(d2p) on at least one side of the
+    crossing.  Prevents noise-floor sign flips from being counted."""
+
+    # --- MAD normalization (cues 1 & 2) ---
+    z_ref: float = 3.0
+    """Clamp scale for MAD-normalized z-scores; values above this map to 1.0."""
+
+    mad_central_fraction: float = 0.80
+    """Fraction of columns used to compute the MAD baseline (central
+    fraction, excluding the tails which may contain edge columns)."""
+
+    # --- OWA fusion (cue aggregation) ---
+    owa_rank_weights: List[float] = field(
+        default_factory=lambda: [0.35, 0.25, 0.20, 0.20]
+    )
+    """OWA rank-weight vector.  weight[k] applies to the k-th LARGEST
+    cue value at each column (Yager 1988 convention)."""
+
+    single_cue_damp: float = 0.5
+    """Multiplier applied to mu_edge[i] when fewer than 2 cues exceed
+    cue_elevation_floor — guards against single-cue false triggers."""
+
+    cue_elevation_floor: float = 0.4
+    """A cue value > this floor counts as 'elevated' for the damp test."""
+
+    # --- Boundary run-length detection ---
+    edge_smooth_sigma: float = 2.0
+    """Gaussian sigma for smoothing mu_edge along the seam axis before
+    run-length detection.  Different purpose from steger_sigma."""
+
+    edge_mu_thresh: float = 0.55
+    """Membership confidence floor for the run-length edge detector."""
+
+    run_min: int = 3
+    """Minimum consecutive above-threshold columns required to declare
+    an off-workpiece edge run."""
+
+    # --- Fallback guard ---
+    min_seam_fraction: float = 0.50
+    """If the kept fraction of columns falls below this, fall back to the
+    full range and emit a structured warning with mu_edge diagnostics."""
+
+    # --- Post-triangulation depth-curvature refinement (Section 3.6) ---
+    enable_depth_refine: bool = True
+    """Enable the optional Z-curvature trim pass after triangulation."""
+
+    kappa_thresh: float = 2.0
+    """MAD-normalized curvature z-score threshold for depth-refine trimming."""
+
+    max_refine_steps: int = 10
+    """Maximum columns to trim per side in the depth-refine pass."""
+
+
+# ---------------------------------------------------------------------------
 # Master Pipeline Config
 # ---------------------------------------------------------------------------
 @dataclass
@@ -294,6 +393,7 @@ class PipelineConfig:
     postprocess: PostProcessConfig = field(default_factory=PostProcessConfig)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     paths: PathConfig = field(default_factory=PathConfig)
+    boundary: BoundaryConfig = field(default_factory=BoundaryConfig)
     seed: int = 42
     processing_mode: str = 'pre_weld_scan'  # Offline scan mode
 

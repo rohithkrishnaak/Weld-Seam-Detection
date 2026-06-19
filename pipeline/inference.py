@@ -37,10 +37,12 @@ from extraction.profile_smoother import full_smoothing_pipeline
 from geometry.triangulation import LaserTriangulator
 from geometry.seam_features import SeamFeatureExtractor
 from geometry.coordinate_chain import CoordinateChain
-from geometry.boundary_bounding import (
-    compute_plate_presence,
-    build_ridge_indicator,
-    localize_seam_boundaries,
+from geometry.seam_boundary import (
+    compute_edge_evidence,
+    fuse_edge_membership,
+    locate_seam_boundaries_radiometric,
+    truncate_to_seam_bounds,
+    refine_boundary_with_depth,
 )
 from pipeline.visualizer import Visualizer
 from pipeline.exporter import PathExporter
@@ -132,8 +134,8 @@ class WeldSeamDetector:
             ``coords_3d``, ``coords_3d_interval``,
             ``robot_coords``, ``seam_features``, ``fuzzy_result``,
             ``timing``, ``visualization``,
-            ``boundary_c_start``, ``boundary_c_end``,
-            ``boundary_env_start``, ``boundary_env_end``.
+            ``boundary_result``, ``gap_interval``,
+            ``gap_detected``.
         """
         timing: Dict[str, float] = {}
 
@@ -181,6 +183,52 @@ class WeldSeamDetector:
             logger.warning("No seam detected in image.")
             return {'pixel_coords': None, 'timing': timing}
 
+        # ── Stage 6.5: Along-Seam Boundary-Aware Truncation ──────────────
+        # Design invariant: compute_edge_evidence operates exclusively on
+        # fuzzy_result.profiles (sampled along Steger normals) and scalar
+        # per-column arrays (strengths, uncertainties, y_lower/upper, normals).
+        # All are already in the post-transpose frame when is_vertical=True,
+        # because fuzzy_pipeline.process() received transposed gray_proc/roi_mask_proc.
+        # NO BGR/orientation-specific handling is required here.
+        t0 = time.perf_counter()
+        # Initialize boundary sub-pixel positions (valid even when Stage 6.5 skipped)
+        frac_start: Optional[float] = None
+        frac_end: Optional[float] = None
+        if len(fuzzy_result.x_coords) >= 4:
+            # Resolve steger_sigma: None → inherit hardware sigma
+            _sigma = (
+                self.config.boundary.steger_sigma
+                if self.config.boundary.steger_sigma is not None
+                else self.config.hardware.sigma
+            )
+            e_str, e_int, e_asym, e_curv = compute_edge_evidence(
+                s=fuzzy_result.strengths,
+                uncertainties=fuzzy_result.uncertainties,  # passed directly, not re-derived
+                y_l=fuzzy_result.y_lower,
+                y_c=fuzzy_result.y_centers,
+                y_r=fuzzy_result.y_upper,
+                profiles=fuzzy_result.profiles,
+                s_coords=fuzzy_result.s_coords,
+                steger_sigma=_sigma,
+                config=self.config.boundary,
+            )
+            mu_edge = fuse_edge_membership(
+                e_str, e_int, e_asym, e_curv, self.config.boundary,
+            )
+            i_start, i_end, frac_start, frac_end = locate_seam_boundaries_radiometric(
+                mu_edge, fuzzy_result.x_coords, self.config.boundary,
+            )
+            fuzzy_result = truncate_to_seam_bounds(fuzzy_result, i_start, i_end)
+            logger.info(
+                "Stage 6.5: seam truncated to columns [%d, %d] "
+                "(%.1f%% of pre-boundary scan; sub-pixel edges: [%.2f, %.2f]).",
+                i_start, i_end,
+                100.0 * len(fuzzy_result.x_coords) / max(len(mu_edge), 1),
+                frac_start, frac_end,
+            )
+        timing['boundary_ms'] = (time.perf_counter() - t0) * 1000
+
+        # ── Stage 3: Coordinate selection (now on truncated arrays) ──
         # Select which centers to use based on mode
         if mode == 'classical':
             x_raw = fuzzy_result.x_coords.astype(np.float64)
@@ -197,57 +245,7 @@ class WeldSeamDetector:
             x_smooth, y_smooth = x_raw.copy(), y_raw.copy()
         timing['smooth_ms'] = (time.perf_counter() - t0) * 1000
 
-        # ── Stage 3.5: Geometric Boundary Localization & Truncation ──
-        # Inserted after smoothing and before triangulation so every
-        # downstream consumer (3-D coords, robot coords, seam features)
-        # automatically inherits the corrected, bounded array.
-        t0 = time.perf_counter()
-        c_start_bound: float = float(x_smooth[0]) if len(x_smooth) > 0 else 0.0
-        c_end_bound:   float = float(x_smooth[-1]) if len(x_smooth) > 0 else float(gray_proc.shape[1] - 1)
-        env_start_bound = (c_start_bound,) * 6
-        env_end_bound   = (c_end_bound,)   * 6
-
-        if len(x_smooth) > 6:
-            try:
-                # Build per-column evidence signals
-                effective_mask = (fuzzy_result.membership_map > 0.3).astype(np.uint8)
-                P_mask, P_chroma, _ = compute_plate_presence(
-                    gray_proc,
-                    effective_mask,
-                    expected_stripe_height=self.config.hardware.w_pixels,
-                    bgr=bgr.T if is_vertical else bgr,
-                )
-                P_ridge = build_ridge_indicator(
-                    fuzzy_result.x_coords, gray_proc.shape[1]
-                )
-
-                (
-                    x_smooth, y_smooth,
-                    c_start_bound, c_end_bound,
-                    env_start_bound, env_end_bound,
-                ) = localize_seam_boundaries(
-                    x_smooth, y_smooth,
-                    P_mask, P_ridge,
-                    W=gray_proc.shape[1],
-                    hardware_cfg=self.config.hardware,
-                    Z_ref=self.config.hardware.depth_confidence_z_ref_mm,
-                )
-                logger.info(
-                    "Stage 3.5 boundary bounding: c_start*=%.1f  c_end*=%.1f  "
-                    "(%d points)",
-                    c_start_bound, c_end_bound, len(x_smooth),
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Stage 3.5 boundary localization failed (%s) — "
-                    "using full smoothed profile.", exc
-                )
-        timing['boundary_ms'] = (time.perf_counter() - t0) * 1000
-
-        if is_vertical:
-            pixel_coords = np.column_stack([y_smooth, x_smooth])
-        else:
-            pixel_coords = np.column_stack([x_smooth, y_smooth])
+        pixel_coords_raw_smoothed = np.column_stack([x_smooth, y_smooth])
 
         # Also smooth classical path for comparison
         pixel_coords_classical = None
@@ -258,11 +256,16 @@ class WeldSeamDetector:
                 x_cl_s, y_cl_s = full_smoothing_pipeline(x_cl, y_cl)
             else:
                 x_cl_s, y_cl_s = x_cl.copy(), y_cl.copy()
-            
+
             if is_vertical:
                 pixel_coords_classical = np.column_stack([y_cl_s, x_cl_s])
             else:
                 pixel_coords_classical = np.column_stack([x_cl_s, y_cl_s])
+
+        # Assemble final pixel_coords (orientation-corrected)
+        pixel_coords = pixel_coords_raw_smoothed
+        if is_vertical:
+            pixel_coords = np.column_stack([y_smooth, x_smooth])
 
         # ── Stage 4: 3-D Triangulation ──
         coords_3d = None
@@ -274,19 +277,40 @@ class WeldSeamDetector:
             t0 = time.perf_counter()
 
             # Crisp 3D points
+            # pixels_to_3d_batch raises ValueError (not silent drop) on parallel
+            # rays, so if it succeeds len(coords_3d) == len(pixel_coords) exactly.
             try:
                 coords_3d = self.triangulator.pixels_to_3d_batch(pixel_coords)
             except ValueError as e:
                 logger.warning("Triangulation failed: %s", e)
                 coords_3d = None
 
-            # 3D confidence interval from IT2FLS bounds
-            if (mode != 'classical'
-                    and fuzzy_result.y_lower is not None
-                    and len(fuzzy_result.y_lower) > 0):
+            # Optional §3.6 depth-curvature refinement — only when triangulation
+            # succeeded (coords_3d is not None).  Alignment is guaranteed: on
+            # success, len(coords_3d) == len(pixel_coords) by pixels_to_3d_batch
+            # contract (see geometry/triangulation.py).
+            if (
+                self.config.boundary.enable_depth_refine
+                and coords_3d is not None
+                and len(coords_3d) >= 4
+            ):
+                i_s, i_e = refine_boundary_with_depth(
+                    coords_3d, 0, len(coords_3d) - 1, self.config.boundary,
+                )
+                if i_e > i_s:   # guard against degenerate trim
+                    coords_3d   = coords_3d[i_s:i_e + 1]
+                    pixel_coords = pixel_coords[i_s:i_e + 1]
+
+            # 3D confidence interval from IT2FLS bounds.
+            # Uses truncated fuzzy_result arrays directly — Stage 6.5 has already
+            # sliced them to the on-workpiece extent before smoothing.
+            if (
+                mode != 'classical'
+                and fuzzy_result.y_lower is not None
+                and len(fuzzy_result.y_lower) > 0
+            ):
                 try:
                     interval_results = []
-                    # Use original (unsmoothed) ridge + normals for interval
                     n_pts = min(
                         len(fuzzy_result.x_coords),
                         len(fuzzy_result.normals_x),
@@ -310,12 +334,12 @@ class WeldSeamDetector:
                                 float(fuzzy_result.normals_x[i]),
                                 float(fuzzy_result.normals_y[i]),
                             ])
-                        y_c = 0.0  # Ridge is already at center
-                        y_l = float(fuzzy_result.y_lower[i] - fuzzy_result.y_centers[i])
-                        y_r = float(fuzzy_result.y_upper[i] - fuzzy_result.y_centers[i])
+                        y_c_off = 0.0  # Ridge is already at center
+                        y_l_off = float(fuzzy_result.y_lower[i] - fuzzy_result.y_centers[i])
+                        y_r_off = float(fuzzy_result.y_upper[i] - fuzzy_result.y_centers[i])
                         try:
                             P_c, P_l, P_r = self.triangulator.pixels_to_3d_interval(
-                                p_ridge, y_c, y_l, y_r, n_hat,
+                                p_ridge, y_c_off, y_l_off, y_r_off, n_hat,
                             )
                             interval_results.append({
                                 'center': P_c, 'lower': P_l, 'upper': P_r,
@@ -375,11 +399,9 @@ class WeldSeamDetector:
             'fuzzy_result': fuzzy_result,
             'timing': timing,
             'visualization': vis_image,
-            # Stage 3.5 boundary bounding outputs
-            'boundary_c_start':   c_start_bound,
-            'boundary_c_end':     c_end_bound,
-            'boundary_env_start': env_start_bound,
-            'boundary_env_end':   env_end_bound,
+            # Stage 6.5 boundary outputs (replaces old Stage B boundary_result)
+            'boundary_frac_start': frac_start if len(fuzzy_result.x_coords) >= 4 else None,
+            'boundary_frac_end':   frac_end   if len(fuzzy_result.x_coords) >= 4 else None,
         }
 
     # ------------------------------------------------------------------

@@ -1,674 +1,743 @@
 """
-Geometric Seam Boundary Localization and Truncation (Stage 3.5).
+Stage B — Geometric Depth-Gating for Weld Seam Boundary Localization.
 
-Implements the two-stage bounding architecture described in the
-"Bounding the Weld Seam" technical report (Round 3 Supplement).
+Replaces the prior 1-D intensity-derivative and Mamdani-FIS boundary
+methods with a purely geometric pipeline that operates on the sub-pixel
+coordinate arrays produced by Steger + EKM (Stage A).
 
-This module addresses the X-axis boundary failure: the pipeline previously
-had no explicit model of plate extent along the seam-length axis, causing:
+The algorithm has four composable stages:
 
-  - **False positives**: the extracted seam extends past the physical metal
-    plate edges into background, fixture, or specular-glint pixels.
-  - **False negatives**: the seam is truncated before the true endpoints
-    because ridge strength drops at chamfers/cut-edges and no recovery
-    mechanism exists for terminal gaps.
+    B.1  Minimum-density pre-filter — rejects isolated glare speckles
+         too short to represent physical plate material.
+    B.2  RANSAC line fit — extracts the maximal inlier set consistent
+         with a linear plate model, discarding background scatter.
+    B.3  Jump-distance clustering — partitions the inlier sequence at
+         spatial discontinuities that correspond to the weld gap.
+    B.4  Plate-cluster selection — identifies the two largest clusters
+         (Plate L, Plate R), derives outer bounds, and annotates the
+         gap interval.
 
-The fix is two clearly separable stages:
+The entry-point ``localize_seam_boundaries_geometric`` orchestrates
+all four stages and returns the topology-preserving truncated arrays
+together with boundary metadata consumed by ``SeamFeatureExtractor``.
 
-Stage A — Plate-Presence Gating (``compute_plate_presence``, ``gate_columns``)
-    A per-column scalar Φ(c) — the plate-presence likelihood — computed
-    independently of Steger ridge strength so it cannot be fooled by
-    the same specular artefacts that fool the ridge detector.  Folded into
-    column admission as a multiplicative gate.
-
-Stage B — Geometric Boundary Localization (``localize_seam_boundaries``)
-    Operates on the assembled per-column (x, y) arrays after smoothing
-    and before triangulation.  Uses:
-
-    1. Mamdani FIS with Sugeno defuzzification to fuse three evidence
-       channels (mask fill-ratio, ridge indicator, local continuity) into
-       a single presence profile Φ(c).
-    2. Gaussian smoothing + central-difference derivatives of Φ(c).
-    3. Argmax-anchored bidirectional zero-crossing search to locate
-       c_start* and c_end* — removes the unjustified center-of-frame prior
-       of the original bisection approach.
-    4. Physically-scaled Hampel/MAD continuity filter with window size
-       derived from the calibrated pixel pitch at the reference depth —
-       invariant to sensor resolution and working-distance changes.
-    5. GTrFN asymmetric confidence envelope per located boundary
-       (diagnostic only; does not alter the crisp truncation boundary).
-
-Integration point in ``WeldSeamDetector.detect()``::
-
-    # After full_smoothing_pipeline, before pixels_to_3d_batch:
-    P_mask, P_chroma, _ = compute_plate_presence(
-        gray, effective_mask, hardware_cfg.w_pixels)
-    P_ridge = build_ridge_indicator(x_steger_cols, gray.shape[1])
-    x_bounded, y_bounded, c_start, c_end, env_s, env_e = \\
-        localize_seam_boundaries(
-            x_smooth, y_smooth, P_mask, P_ridge, W=gray.shape[1],
-            hardware_cfg=hardware_cfg,
-            Z_ref=hardware_cfg.depth_confidence_z_ref_mm)
+Failure Modes Addressed
+-----------------------
+* **False negative at weld gap** — the prior derivative method fired
+  at the gap (no signal → large derivative) before reaching the far
+  plate.  Jump-distance clustering distinguishes gap discontinuities
+  from terminal boundaries: points across the gap are retained in the
+  output because the truncation window spans *both* plates.
+* **False positive into background** — glare highlights with rounded
+  intensity profiles can satisfy the Steger ridge criterion and extend
+  the coordinate array beyond the physical metal.  RANSAC rejects these
+  as geometric outliers because they lie off the plate line by more than
+  the physically derived inlier tolerance δ_plate.
 
 References
 ----------
-[1] Canny, J. (1986). A Computational Approach to Edge Detection.
-    IEEE TPAMI, 8(6), 679-698.
-[2] Marr, D. & Hildreth, E. (1980). Theory of Edge Detection.
-    Proc. Royal Society B, 207(1167), 187-217.
-[3] Hampel, F.R. (1974). The Influence Curve and its Role in Robust
-    Estimation. JASA, 69(346), 383-393.
-[8] Mamdani, E.H. & Assilian, S. (1975). An experiment in linguistic
-    synthesis with a fuzzy logic controller. IJMMS, 7(1), 1-13.
-[10] Chen, S.H. & Hsieh, C.H. (2000). Representation, ranking, distance,
-     and similarity of L-R type fuzzy number and application.
-     Australian J. Intelligent Info. Processing Sys., 6(4), 217-229.
+[1] Fischler, M. A. & Bolles, R. C. (1981). Random sample consensus:
+    A paradigm for model fitting with applications to image analysis
+    and automated cartography. *Communications of the ACM*, 24(6),
+    381-395.
+[2] Bogoslavskyi, I. & Stachniss, C. (2016). Fast range image-based
+    segmentation of sparse 3D laser scans for online operation.
+    *Proceedings of IEEE/RSJ IROS*, 163-169.
+[3] Steger, C. (1998). An unbiased detector of curvilinear structures.
+    *IEEE TPAMI*, 20(2), 113-125.
+[4] Hartley, R. & Zisserman, A. (2004). *Multiple View Geometry in
+    Computer Vision* (2nd ed.). Cambridge University Press.
+[5] Zou, Y., Chen, J. & Wei, X. (2020). Research on a real-time weld
+    seam tracking method for medium-thick plates. *Journal of
+    Manufacturing Processes*, 56, 538-551.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
+import math
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
 import numpy as np
-from scipy.ndimage import gaussian_filter1d
-
-from config import HardwareConfig
 
 logger = logging.getLogger(__name__)
 
-_EPS = 1e-12
+
+# ======================================================================
+# Public result dataclass
+# ======================================================================
+
+@dataclass
+class BoundaryResult:
+    """Structured output of the geometric boundary localization pipeline.
+
+    Attributes
+    ----------
+    u_bounded : np.ndarray, shape (M,)
+        Column coordinates truncated to the physical seam extent.
+    v_bounded : np.ndarray, shape (M,)
+        Corresponding fuzzy-enhanced row centers.
+    v_lo_bounded : np.ndarray, shape (M,)
+        EKM lower bounds for retained points (uncertainty propagation).
+    v_hi_bounded : np.ndarray, shape (M,)
+        EKM upper bounds for retained points (uncertainty propagation).
+    in_gap_mask : np.ndarray of bool, shape (M,)
+        True for points that fall inside the weld gap interval.
+        These points are geometrically valid (gap floor / scatter) and
+        must be preserved for V-groove feature extraction.
+    u_start : float
+        Left physical boundary (outer edge of Plate L).
+    u_end : float
+        Right physical boundary (outer edge of Plate R).
+    gap_interval : tuple[float, float]
+        (u_gap_left, u_gap_right) — inner edges of the weld gap.
+    gap_detected : bool
+        True when two distinct plate clusters were identified.
+    plate_L_bounds : tuple[float, float]
+        (u_start, u_gap_left) column range of the left plate.
+    plate_R_bounds : tuple[float, float]
+        (u_gap_right, u_end) column range of the right plate.
+    ransac_line : tuple[float, float]
+        Refined OLS line parameters (slope m*, intercept b*).
+    n_inliers : int
+        Number of RANSAC inlier points.
+    n_discarded_clusters : int
+        Clusters rejected as background / glare.
+    """
+
+    u_bounded: np.ndarray
+    v_bounded: np.ndarray
+    v_lo_bounded: np.ndarray
+    v_hi_bounded: np.ndarray
+    in_gap_mask: np.ndarray
+
+    u_start: float
+    u_end: float
+    gap_interval: Tuple[float, float]
+    gap_detected: bool
+
+    ransac_line: Tuple[float, float]
+    n_inliers: int
+    n_valid_clusters: int
 
 
-# ============================================================
-# Stage A — Plate-Presence Gating
-# ============================================================
+# ======================================================================
+# Internal cluster descriptor (lightweight)
+# ======================================================================
 
-def compute_plate_presence(
-    gray: np.ndarray,
-    effective_mask: np.ndarray,
-    expected_stripe_height: int,
-    bgr: Optional[np.ndarray] = None,
-    tau_contrast: float = 10.0,
-    s_contrast: float = 5.0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute per-column plate-presence evidence arrays (Stage A).
+@dataclass
+class _Cluster:
+    """Describes a single contiguous cluster of inlier points."""
 
-    Two complementary signals are returned, both independent of Steger
-    ridge strength, so they cannot be fooled by the same specular
-    artefacts that trigger false ridge acceptances.
+    indices: List[int]   # indices into the inlier arrays u_in / v_in
+    u_min: float
+    u_max: float
+    span: float
+    size: int
+
+
+# ======================================================================
+# Stage B.1 — Minimum-density pre-filter
+# ======================================================================
+
+def filter_minimum_density(
+    u: np.ndarray,
+    v: np.ndarray,
+    v_lo: np.ndarray,
+    v_hi: np.ndarray,
+    L_min: int = 10,
+    intra_gap_px: float = 2.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Remove isolated column runs too short to be physical plate material.
+
+    A *run* is a maximal set of consecutive indices in the sorted column
+    array ``u`` where no two adjacent entries differ by more than
+    ``intra_gap_px`` pixels.  Runs shorter than ``L_min`` are discarded
+    as glare speckles or noise.
 
     Parameters
     ----------
-    gray : np.ndarray, shape (H, W)
-        Float64 grayscale image (red channel for a 650 nm laser).
-    effective_mask : np.ndarray, shape (H, W)
-        Binary mask from FCM + fuzzy morphology (non-zero = stripe).
-    expected_stripe_height : int
-        Nominal laser-stripe pixel height (``HardwareConfig.w_pixels``).
-        Used to normalise the mask-fill ratio to [0, 1].
-    bgr : np.ndarray, shape (H, W, 3), optional
-        Original BGR image.  When provided, the red-dominance signal
-        R − max(G, B) is computed from it for a more precise
-        chromaticity column coherence score.  When None, ``gray`` is
-        used as a proxy (single-channel fallback).
-    tau_contrast : float
-        Sigmoid centre for the chromaticity contrast ratio.
-    s_contrast : float
-        Sigmoid softness for the chromaticity contrast ratio.
+    u, v : np.ndarray, shape (N,)
+        Sorted sub-pixel column and row coordinates (u strictly ≥ previous).
+    v_lo, v_hi : np.ndarray, shape (N,)
+        EKM lower / upper bounds carried through the filter.
+    L_min : int
+        Minimum contiguous run length to retain.  Default 10 corresponds
+        to approximately 1 mm of plate at nominal calibration scale.
+    intra_gap_px : float
+        Maximum consecutive column gap that is still considered *within*
+        a single run.  Default 2.0 px.
 
     Returns
     -------
-    P_mask : np.ndarray, shape (W,)
-        Column mask-fill ratio clipped to [0, 1].
-    P_chroma : np.ndarray, shape (W,)
-        Column chromaticity coherence score in [0, 1].
-    peak_row : np.ndarray, shape (W,)
-        Row index of the chromaticity peak per column (diagnostic).
+    u_f, v_f, v_lo_f, v_hi_f : np.ndarray
+        Filtered arrays (may be shorter than input).
+
+    Notes
+    -----
+    A gap ≤ ``intra_gap_px`` is tolerated within a run because
+    ``interpolate_gaps`` in ``profile_smoother.py`` fills gaps up to
+    5 px later in the pipeline; we do not want to split runs prematurely.
     """
-    H, W = gray.shape[:2]
-    expected_stripe_height = max(expected_stripe_height, 1)
+    N = len(u)
+    if N == 0:
+        return u.copy(), v.copy(), v_lo.copy(), v_hi.copy()
 
-    # ── P_mask: column mask-fill ratio ──
-    col_mask_count = effective_mask.astype(np.float64).sum(axis=0)   # (W,)
-    P_mask = np.clip(col_mask_count / expected_stripe_height, 0.0, 1.0)
+    # Identify run boundaries
+    keep = np.zeros(N, dtype=bool)
+    run_start = 0
 
-    # ── Chromaticity column coherence ──
-    if bgr is not None and bgr.ndim == 3:
-        r = bgr[:, :, 2].astype(np.float32)
-        g = bgr[:, :, 1].astype(np.float32)
-        b = bgr[:, :, 0].astype(np.float32)
-        red_dom = (r - np.maximum(g, b)).astype(np.float64)
+    for i in range(1, N):
+        if (u[i] - u[i - 1]) > intra_gap_px:
+            # Close the current run
+            run_len = i - run_start
+            if run_len >= L_min:
+                keep[run_start:i] = True
+            run_start = i
+
+    # Close the final run
+    run_len = N - run_start
+    if run_len >= L_min:
+        keep[run_start:N] = True
+
+    n_removed = int(np.sum(~keep))
+    if n_removed > 0:
+        logger.debug(
+            "Stage B.1: removed %d points in runs < L_min=%d.", n_removed, L_min
+        )
+
+    return u[keep], v[keep], v_lo[keep], v_hi[keep]
+
+
+# ======================================================================
+# Stage B.2 — RANSAC line fit
+# ======================================================================
+
+def ransac_line_fit(
+    u: np.ndarray,
+    v: np.ndarray,
+    delta_plate: float = 4.0,
+    n_ransac: Optional[int] = None,
+    p_success: float = 0.99,
+    outlier_fraction: float = 0.40,
+    rng_seed: int = 42,
+) -> Tuple[np.ndarray, float, float]:
+    """Fit a line v = m·u + b to (u, v) via RANSAC and refine with OLS.
+
+    RANSAC [1] is used rather than direct OLS because the point cloud
+    may contain 10–40 % outliers from glare highlights and background
+    scatter.  The algorithm returns the maximal inlier set, which
+    corresponds to physical plate material.
+
+    Parameters
+    ----------
+    u, v : np.ndarray, shape (N,)
+        Filtered sub-pixel coordinates (already sorted by u).
+    delta_plate : float
+        Inlier tolerance in pixels.  Points with residual
+        |v_i − (m·u_i + b)| ≤ δ_plate are considered inliers.
+        Derived from the depth-precision model:
+
+            δZ   = Z² / (f · B) · δp
+                 = 200² / (16 × 100) × 0.1  ≈  0.25 mm
+            δv   = δZ · f_px / Z
+                 ≈ 0.25 × 370 / 200         ≈  0.46 px
+
+        Default 1.0 px ≈ 2σ of the plate measurement noise.
+    n_ransac : int, optional
+        Override the iteration count.  When *None* (default) it is
+        computed from ``p_success`` and ``outlier_fraction`` via the
+        standard RANSAC formula [1]:
+
+            n = ⌈ log(1 - p) / log(1 - (1 - ε)²) ⌉
+
+        where ε = ``outlier_fraction`` and the minimal sample size is 2.
+    p_success : float
+        Target probability of drawing at least one all-inlier sample.
+    outlier_fraction : float
+        Assumed worst-case fraction of outliers (ε in the RANSAC
+        iteration formula).
+    rng_seed : int
+        Seed for reproducible random sampling.
+
+    Returns
+    -------
+    inlier_mask : np.ndarray of bool, shape (N,)
+        True for inlier points.
+    m_star : float
+        OLS-refined line slope.
+    b_star : float
+        OLS-refined line intercept.
+
+    Raises
+    ------
+    ValueError
+        If fewer than 2 points remain after filtering (no line possible).
+    """
+    N = len(u)
+    if N < 2:
+        raise ValueError(
+            f"RANSAC requires at least 2 points, got {N}."
+        )
+
+    # Compute required iteration count from RANSAC theory [1]
+    if n_ransac is None:
+        # Minimal sample set s = 2 (line)
+        inlier_prob = (1.0 - outlier_fraction) ** 2
+        inlier_prob = max(inlier_prob, 1e-12)   # guard log(0)
+        n_ransac = int(math.ceil(
+            math.log(1.0 - p_success) / math.log(1.0 - inlier_prob)
+        ))
+        n_ransac = max(n_ransac, 100)            # floor at 100 for robustness
+        logger.debug("Stage B.2: RANSAC n_iter=%d (ε=%.2f, p=%.2f).",
+                     n_ransac, outlier_fraction, p_success)
+
+    rng = np.random.RandomState(rng_seed)
+    best_mask = np.zeros(N, dtype=bool)
+    best_count = 0
+
+    for _ in range(n_ransac):
+        # Minimal sample: 2 distinct indices
+        i_a, i_b = rng.choice(N, size=2, replace=False)
+        u_a, v_a = float(u[i_a]), float(v[i_a])
+        u_b, v_b = float(u[i_b]), float(v[i_b])
+
+        du = u_b - u_a
+        if abs(du) < 1e-12:
+            continue   # degenerate vertical pair — skip
+
+        m_cand = (v_b - v_a) / du
+        b_cand = v_a - m_cand * u_a
+
+        # Signed residuals (absolute value for inlier test)
+        residuals = np.abs(v - (m_cand * u + b_cand))
+        mask_cand = residuals <= delta_plate
+        count_cand = int(np.sum(mask_cand))
+
+        if count_cand > best_count:
+            best_count = count_cand
+            best_mask = mask_cand
+
+        # Early exit: inlier fraction > 90 %
+        if count_cand / N > 0.90:
+            break
+
+    if best_count < 2:
+        raise ValueError(
+            "RANSAC found fewer than 2 inliers — scene geometry is "
+            "too cluttered or delta_plate is too tight."
+        )
+
+    # ── OLS refinement on full inlier set ──────────────────────────────
+    # Minimize Σ (v_i − m·u_i − b)² over {i : best_mask[i]}
+    u_in = u[best_mask].astype(np.float64)
+    v_in = v[best_mask].astype(np.float64)
+    N_in = len(u_in)
+
+    S_u  = float(np.sum(u_in))
+    S_v  = float(np.sum(v_in))
+    S_uu = float(np.dot(u_in, u_in))
+    S_uv = float(np.dot(u_in, v_in))
+
+    denom_ls = N_in * S_uu - S_u ** 2
+    if abs(denom_ls) < 1e-12:
+        m_star = 0.0
+        b_star = S_v / N_in
     else:
-        # Single-channel fallback: use raw intensity
-        red_dom = gray.astype(np.float64)
+        m_star = (N_in * S_uv - S_u * S_v) / denom_ls
+        b_star = (S_v - m_star * S_u) / N_in
 
-    peak_val = red_dom.max(axis=0)            # (W,)
-    peak_row = red_dom.argmax(axis=0)         # (W,)
-    bg_med = np.median(red_dom, axis=0)       # (W,)
+    # Re-evaluate inlier membership with the refined line
+    residuals_final = np.abs(v - (m_star * u + b_star))
+    final_mask = residuals_final <= delta_plate
+    final_count = int(np.sum(final_mask))
 
-    contrast = peak_val - bg_med              # (W,)
-    # Sigmoid: 0 when contrast ≪ tau_contrast, 1 when contrast ≫ tau_contrast
-    P_chroma = 1.0 / (1.0 + np.exp(-(contrast - tau_contrast) / (s_contrast + _EPS)))
+    logger.debug(
+        "Stage B.2: RANSAC best=%d, OLS-refined inliers=%d / %d  "
+        "line=(m=%.4f, b=%.4f).",
+        best_count, final_count, N, m_star, b_star,
+    )
 
-    return P_mask, P_chroma, peak_row.astype(np.float64)
-
-
-def gate_columns(
-    valid_pixel_mask: np.ndarray,
-    P_mask: np.ndarray,
-    P_chroma: np.ndarray,
-    tau_phi: float = 0.5,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Apply the Stage A column gate to Steger's pixel-level valid mask.
-
-    The gate is strictly additive from the pipeline's perspective: it
-    can only *remove* columns that the existing Hessian criteria would
-    have accepted; it never adds new ones.
-
-    Parameters
-    ----------
-    valid_pixel_mask : np.ndarray, shape (H, W), dtype bool
-        Per-pixel validity from Steger's acceptance criteria.
-    P_mask : np.ndarray, shape (W,)
-        Column mask-fill ratio (from ``compute_plate_presence``).
-    P_chroma : np.ndarray, shape (W,)
-        Column chromaticity coherence (from ``compute_plate_presence``).
-    tau_phi : float
-        Gate threshold.  Columns with Φ(c) < tau_phi are suppressed.
-
-    Returns
-    -------
-    gated_mask : np.ndarray, shape (H, W), dtype bool
-        Tightened pixel mask.
-    Phi : np.ndarray, shape (W,)
-        Per-column gate score Φ(c) ∈ [0, 1].
-    """
-    Phi = 0.5 * P_mask + 0.5 * P_chroma          # (W,)
-    column_gate = Phi >= tau_phi                   # (W,) boolean
-    # Broadcast gate across rows
-    gated_mask = valid_pixel_mask & column_gate[np.newaxis, :]
-    return gated_mask, Phi
+    return final_mask, float(m_star), float(b_star)
 
 
-def build_ridge_indicator(
-    x_steger_cols: np.ndarray,
-    W: int,
-) -> np.ndarray:
-    """Build a per-column ridge indicator P_ridge(c) ∈ {0, 1}.
+# ======================================================================
+# Stage B.3 — Jump-distance clustering
+# ======================================================================
 
-    A column receives value 1 if at least one Steger ridge point was
-    accepted in it; 0 otherwise.
+def jump_distance_clustering(
+    u_in: np.ndarray,
+    gap_min_px: float = 3.0,
+    gross_gap_limit: float = 50.0,
+) -> List[_Cluster]:
+    """Partition an inlier column array into contiguous spatial clusters.
+
+    Physical plate material appears as a dense run of columns; the weld
+    gap creates a large spatial discontinuity.  Consecutive column gaps
+    Δ_i = u_{i+1} − u_i form a bimodal distribution:
+
+        * Intra-plate gaps:  ≈ 1 px  (dense Steger sampling)
+        * Weld gap:          ≥ gap_min_px  (physical gap in metal)
+        * Background jumps:  potentially very large (>> gap_min_px)
+
+    The adaptive threshold
+
+        Δ_split = max(gap_min_px,  5 × median(Δ_i < gross_gap_limit))
+
+    separates these modes robustly, adapting to camera resolution and
+    working-distance variations without manual re-tuning [2].
 
     Parameters
     ----------
-    x_steger_cols : np.ndarray
-        Integer (or float, rounded) column indices of accepted ridge points.
-    W : int
-        Total image width.
+    u_in : np.ndarray, shape (N_in,)
+        Sorted inlier column coordinates (ascending).
+    gap_min_px : float
+        Minimum expected weld gap width in pixels.  Gaps smaller than
+        this cannot be physical weld gaps.  Default 3.0 px.
+    gross_gap_limit : float
+        Upper limit for identifying "intra-plate" gaps when computing
+        the adaptive threshold.  Gaps larger than this are definitely
+        inter-cluster breaks and are excluded from the median.
 
     Returns
     -------
-    P_ridge : np.ndarray, shape (W,)
+    list of _Cluster
+        Each cluster describes a contiguous run of inlier points.
+        Singleton clusters (size < 2) are discarded.
     """
-    P_ridge = np.zeros(W, dtype=np.float64)
-    cols = np.round(x_steger_cols).astype(int)
-    cols = cols[(cols >= 0) & (cols < W)]
-    P_ridge[cols] = 1.0
-    return P_ridge
+    N_in = len(u_in)
+    if N_in == 0:
+        return []
+    if N_in == 1:
+        return [_Cluster(indices=[0], u_min=float(u_in[0]),
+                         u_max=float(u_in[0]), span=0.0, size=1)]
+
+    delta = u_in[1:] - u_in[:-1]   # shape (N_in - 1,)
+
+    # Adaptive threshold: 5× median intra-plate gap, floored at gap_min_px
+    small = delta[delta < gross_gap_limit]
+    median_intra = float(np.median(small)) if len(small) > 0 else 1.0
+    delta_split = max(gap_min_px, 5.0 * median_intra)
+
+    logger.debug(
+        "Stage B.3: median_intra=%.3f px, Δ_split=%.3f px.",
+        median_intra, delta_split,
+    )
+
+    # Identify boundary positions (indices into u_in, not delta)
+    split_positions = np.where(delta > delta_split)[0] + 1  # index of first point in new cluster
+
+    # Build cluster ranges [start, end)
+    boundaries = [0] + split_positions.tolist() + [N_in]
+    clusters: List[_Cluster] = []
+
+    for k in range(len(boundaries) - 1):
+        a = boundaries[k]
+        b = boundaries[k + 1]
+        if (b - a) < 2:
+            continue   # discard singletons
+        clusters.append(_Cluster(
+            indices=list(range(a, b)),
+            u_min=float(u_in[a]),
+            u_max=float(u_in[b - 1]),
+            span=float(u_in[b - 1] - u_in[a]),
+            size=b - a,
+        ))
+
+    logger.debug(
+        "Stage B.3: %d clusters identified (Δ_split=%.2f px).",
+        len(clusters), delta_split,
+    )
+    return clusters
 
 
-# ============================================================
-# Stage B — Boundary Localization
-# ============================================================
+# ======================================================================
+# Stage B.4 — Plate-cluster selection and physical bound derivation
+# ======================================================================
 
-# ── Helper: triangular membership function ──────────────────
+def find_global_extent_and_gap(
+    clusters: List[_Cluster],
+    span_min: float = 20.0,
+    gap_min_px: float = 3.0,
+) -> Tuple[float, float, float, float, bool, int]:
+    """Identify the global bounding extent and the weld gap from valid clusters.
 
-def _trimf(v: np.ndarray, a: float, b: float, c: float) -> np.ndarray:
-    """Triangular membership function TRIMF(v, a, b, c).
-
-    Returns max(0, min((v-a)/(b-a), (c-v)/(c-b))).
-    Handles degenerate cases (a==b or b==c) gracefully.
-    """
-    with np.errstate(divide='ignore', invalid='ignore'):
-        left = np.where(
-            np.abs(b - a) > _EPS,
-            np.where(b - a > _EPS, (v - a) / (b - a), 0.0),
-            np.where(v >= b, 1.0, 0.0),
-        )
-        right = np.where(
-            np.abs(c - b) > _EPS,
-            np.where(c - b > _EPS, (c - v) / (c - b), 0.0),
-            np.where(v <= b, 1.0, 0.0),
-        )
-    return np.clip(np.minimum(left, right), 0.0, 1.0)
-
-
-def fuzzy_fuse_presence(
-    P_mask: np.ndarray,
-    P_ridge: np.ndarray,
-    P_continuity: np.ndarray,
-) -> np.ndarray:
-    """Mamdani FIS with Sugeno defuzzification: fuse three evidence channels.
-
-    Implements the 5-rule base from §3.2.1 of the technical report:
-
-    R1: P_mask=HIGH ∧ P_ridge=HIGH ∧ P_continuity=HIGH → Φ = HIGH (0.9)
-    R2: P_mask=LOW  ∧ P_ridge=HIGH ∧ P_continuity=HIGH → Φ = MED  (0.5)
-    R3: P_mask=HIGH ∧ P_ridge=LOW  ∧ P_continuity=HIGH → Φ = MED  (0.5)
-    R4: P_mask=LOW  ∧ P_ridge=LOW  ∧ P_continuity=HIGH → Φ = LOW  (0.1)
-    R5: P_mask=LOW  ∧ P_ridge=LOW  ∧ P_continuity=LOW  → Φ = LOW  (0.1)
-
-    Antecedents connected by fuzzy AND = min.
-    Defuzzification: Sugeno weighted average (closed-form, no area integration).
+    Discard any cluster with span < span_min. The bounding extent covers
+    all remaining clusters. The weld gap is identified as the largest jump
+    between consecutive valid clusters.
 
     Parameters
     ----------
-    P_mask, P_ridge, P_continuity : np.ndarray, shape (W,)
-        All three inputs must be in [0, 1].
+    clusters : list of _Cluster
+        Output of ``jump_distance_clustering``.
+    span_min : float
+        Minimum cluster horizontal span to be considered valid plate material.
+    gap_min_px : float
+        Minimum gap width required for ``gap_detected`` to be True.
 
     Returns
     -------
-    Phi : np.ndarray, shape (W,)
-        Fused plate-presence likelihood, in (0, 1).
+    u_start  : float — left outer boundary (global minimum u)
+    u_end    : float — right outer boundary (global maximum u)
+    u_gap_left  : float — left edge of the weld gap
+    u_gap_right : float — right edge of the weld gap
+    gap_detected : bool
+    n_valid_clusters : int
     """
-    # Shared triangular membership functions (all inputs normalized to [0,1])
-    mu_low  = lambda v: _trimf(v, 0.0, 0.0, 0.5)   # noqa: E731
-    mu_med  = lambda v: _trimf(v, 0.2, 0.5, 0.8)   # noqa: E731
-    mu_high = lambda v: _trimf(v, 0.5, 1.0, 1.0)   # noqa: E731
+    if len(clusters) == 0:
+        raise ValueError("No clusters provided.")
 
-    m_lo = mu_low(P_mask);   m_md = mu_med(P_mask);   m_hi = mu_high(P_mask)
-    r_lo = mu_low(P_ridge);  r_md = mu_med(P_ridge);  r_hi = mu_high(P_ridge)
-    k_lo = mu_low(P_continuity); k_md = mu_med(P_continuity); k_hi = mu_high(P_continuity)
-
-    # Crisp Sugeno consequents (singletons)
-    z_LOW, z_MED, z_HIGH = 0.1, 0.5, 0.9
-
-    # Rule firing strengths (fuzzy AND = min), vectorized
-    mu1 = np.minimum(np.minimum(m_hi, r_hi), k_hi)   # R1 → HIGH
-    mu2 = np.minimum(np.minimum(m_lo, r_hi), k_hi)   # R2 → MED
-    mu3 = np.minimum(np.minimum(m_hi, r_lo), k_hi)   # R3 → MED
-    mu4 = np.minimum(np.minimum(m_lo, r_lo), k_hi)   # R4 → LOW
-    mu5 = np.minimum(np.minimum(m_lo, r_lo), k_lo)   # R5 → LOW
-
-    num = mu1 * z_HIGH + mu2 * z_MED + mu3 * z_MED + mu4 * z_LOW + mu5 * z_LOW
-    den = mu1 + mu2 + mu3 + mu4 + mu5
-
-    # Sugeno weighted average; fall back to 0 where no rules fire
-    with np.errstate(divide='ignore', invalid='ignore'):
-        Phi = np.where(den > _EPS, num / den, 0.0)
-    return Phi
-
-
-def build_gtrfn_envelope(
-    Phi_smooth: np.ndarray,
-    c_star: float,
-    half_decay: float = 0.5,
-) -> Tuple[float, float, float, float, float, float]:
-    """Fit an asymmetric Generalised Trapezoidal Fuzzy Number around c_star.
-
-    The GTrFN Ã = (a1, a2, a3, a4; h) encodes the boundary confidence
-    envelope.  The crisp core a2=a3=c* is the located zero-crossing;
-    the spreads a1 and a4 are fit from the empirical decay rate of
-    Phi_smooth on each side (the column offset at which Phi_smooth first
-    falls below half_decay * Phi_smooth(c*)).
-
-    This is a **diagnostic** — it does not alter the crisp truncation
-    boundary used in localize_seam_boundaries.
-
-    Parameters
-    ----------
-    Phi_smooth : np.ndarray, shape (W,)
-        Smoothed presence profile.
-    c_star : float
-        Sub-pixel boundary column (e.g. c_start* or c_end*).
-    half_decay : float
-        Fraction of Phi_smooth(c*) used as the spread stopping criterion.
-
-    Returns
-    -------
-    (a1, a2, a3, a4, h, centroid) : tuple of float
-    """
-    W = len(Phi_smooth)
-    c_int = int(np.clip(round(c_star), 0, W - 1))
-    peak_val = float(Phi_smooth[c_int])
-    target = half_decay * peak_val
-
-    # Walk inward (toward centre) — gradual background re-entry side
-    delta_in = 0
-    while (c_int - delta_in) > 0 and Phi_smooth[c_int - delta_in] > target:
-        delta_in += 1
-
-    # Walk outward (away from centre) — sharp plate-exit side
-    delta_out = 0
-    while (c_int + delta_out) < W - 1 and Phi_smooth[c_int + delta_out] > target:
-        delta_out += 1
-
-    a1 = c_star - delta_in
-    a2 = c_star
-    a3 = c_star
-    a4 = c_star + delta_out
-    max_phi = float(Phi_smooth.max()) if Phi_smooth.max() > _EPS else 1.0
-    h = peak_val / max_phi
-    centroid = ((a1 + a2 + a3 + a4) / 4.0) * h   # closed-form GTrFN centroid
-
-    return a1, a2, a3, a4, h, centroid
-
-
-def localize_seam_boundaries(
-    x_cols: np.ndarray,
-    y_vals: np.ndarray,
-    P_mask: np.ndarray,
-    P_ridge: np.ndarray,
-    W: int,
-    sigma_b: float = 4.0,
-    mad_k: float = 3.0,
-    L_w_mm: float = 2.0,
-    hardware_cfg: Optional[HardwareConfig] = None,
-    Z_ref: Optional[float] = None,
-    y_scale: float = 5.0,
-) -> Tuple[np.ndarray, np.ndarray, float, float,
-           Tuple, Tuple]:
-    """Locate physical plate boundaries and truncate the seam array (Stage B).
-
-    Parameters
-    ----------
-    x_cols : np.ndarray, shape (M,)
-        Sorted integer column indices from the smoothed seam path.
-    y_vals : np.ndarray, shape (M,)
-        Corresponding sub-pixel Y centres.
-    P_mask : np.ndarray, shape (W,)
-        Column mask-fill ratio (Stage A output).
-    P_ridge : np.ndarray, shape (W,)
-        Binary column ridge indicator (from ``build_ridge_indicator``).
-    W : int
-        Full image width.
-    sigma_b : float
-        Gaussian smoothing scale (columns) for the presence profile.
-    mad_k : float
-        MAD rejection multiplier (≈ 3, matching the existing z_threshold
-        convention in profile_smoother.py).
-    L_w_mm : float
-        Physical Hampel window length in mm (default 2 mm).
-    hardware_cfg : HardwareConfig, optional
-        Provides ``sensor_pixel_size_um`` and ``focal_length_mm`` for
-        pixel-pitch computation.  When None a fallback of 7 columns is used.
-    Z_ref : float, optional
-        Reference depth in mm for pixel-pitch computation.  When None,
-        defaults to ``hardware_cfg.depth_confidence_z_ref_mm`` if
-        hardware_cfg is provided, else 200 mm.
-    y_scale : float
-        Characteristic seam curvature scale (px) for the continuity signal.
-
-    Returns
-    -------
-    x_bounded : np.ndarray
-        Truncated column indices within the validated plate extent.
-    y_bounded : np.ndarray
-        Corresponding Y centres.
-    c_start : float
-        Sub-pixel left (start) boundary column.
-    c_end : float
-        Sub-pixel right (end) boundary column.
-    env_start : tuple
-        GTrFN envelope (a1, a2, a3, a4, h, centroid) for the start boundary.
-    env_end : tuple
-        GTrFN envelope for the end boundary.
-    """
-    M = len(x_cols)
-
-    # ── Step 1: Continuity signal & Fuzzy FIS fusion ──────────────────
-    P_continuity = np.zeros(W, dtype=np.float64)
-    x_int = np.round(x_cols).astype(int)
-    for i in range(1, M - 1):
-        dy_left  = abs(float(y_vals[i]) - float(y_vals[i - 1]))
-        dy_right = abs(float(y_vals[i + 1]) - float(y_vals[i]))
-        col = int(np.clip(x_int[i], 0, W - 1))
-        P_continuity[col] = float(
-            np.exp(-(dy_left + dy_right) / (2.0 * max(y_scale, _EPS)))
-        )
-
-    Phi = fuzzy_fuse_presence(P_mask, P_ridge, P_continuity)
-
-    # ── Step 2: Gaussian smooth + derivatives ─────────────────────────
-    Phi_smooth = gaussian_filter1d(Phi.astype(np.float64), sigma=sigma_b)
-
-    # Central differences (pad edges with nearest value)
-    d1Phi = np.gradient(Phi_smooth)
-    d2Phi = np.gradient(d1Phi)
-
-    # ── Step 3: Argmax-anchored bidirectional zero-crossing search ────
-    c_peak = int(np.argmax(Phi_smooth))
-
-    def _find_zero_crossing(d2: np.ndarray, start: int, stop: int, step: int):
-        """Traverse from start toward stop (step = ±1); return first k where
-        sign(d2[k]) ≠ sign(d2[k+step]), or None if not found."""
-        indices = range(start, stop, step)
-        for k in indices:
-            k_next = k + step
-            if 0 <= k_next < len(d2):
-                if d2[k] * d2[k_next] < 0:   # sign change
-                    return k
-        return None
-
-    c_start_int = _find_zero_crossing(d2Phi, c_peak, 0, -1)
-    c_end_int   = _find_zero_crossing(d2Phi, c_peak, W - 1, +1)
-
-    # Fallback: if no crossing found, use the edges of the detected point range
-    if c_start_int is None:
-        c_start_int = max(int(x_int.min()) - 1, 0)
-        logger.warning("No left zero-crossing found; falling back to min column %d.", c_start_int)
-    if c_end_int is None:
-        c_end_int = min(int(x_int.max()) + 1, W - 2)
-        logger.warning("No right zero-crossing found; falling back to max column %d.", c_end_int)
-
-    # Sub-pixel refinement (1st-order Taylor expansion of d2Phi about zero)
-    def _subpixel_refine(d2: np.ndarray, k: int, step: int) -> float:
-        k_next = k + step
-        if 0 <= k_next < len(d2):
-            denom = d2[k_next] - d2[k]
-            if abs(denom) > _EPS:
-                return float(k) - float(d2[k]) / denom
-        return float(k)
-
-    c_start = _subpixel_refine(d2Phi, c_start_int, +1)   # leftward result
-    c_end   = _subpixel_refine(d2Phi, c_end_int,   +1)   # rightward result
-
-    # ── Safety clamp: boundaries must lie within the data range ──────
-    # The FIS operates over the full image width but may produce a very
-    # narrow peak if the Steger output is sparse (e.g. few ridge points).
-    # Clamp boundaries to [data_min, data_max] so we never over-truncate.
-    data_col_min = float(x_int.min())
-    data_col_max = float(x_int.max())
-    data_span = data_col_max - data_col_min
-
-    # Guarantee ordering (c_start ≤ c_end) — by construction but defensive
-    if c_start > c_end:
-        c_start, c_end = c_end, c_start
-
-    # If the located window is narrower than 10% of the data span, the
-    # boundary finder likely converged on a spurious local feature rather
-    # than the true plate edges — fall back to the data range.
-    located_span = c_end - c_start
-    if located_span < max(data_span * 0.10, 10):
+    valid_clusters = [c for c in clusters if c.span >= span_min]
+    
+    if len(valid_clusters) == 0:
+        # Fallback to the single largest cluster
+        largest = max(clusters, key=lambda c: c.span)
+        valid_clusters = [largest]
         logger.warning(
-            "Boundary window (%.1f columns) is implausibly narrow relative to "
-            "data span (%.1f columns) — falling back to data range.",
-            located_span, data_span,
+            "Stage B.4: no cluster met span_min=%.1f — using single largest cluster.",
+            span_min
         )
-        c_start = data_col_min
-        c_end   = data_col_max
-    else:
-        # Soft-clamp: do not cut into the data range
-        c_start = min(c_start, data_col_min)
-        c_end   = max(c_end,   data_col_max)
+        
+    # Sort valid clusters left to right by their minimum column position
+    valid_clusters = sorted(valid_clusters, key=lambda c: c.u_min)
+    K = len(valid_clusters)
+    
+    u_start = min(c.u_min for c in valid_clusters)
+    u_end = max(c.u_max for c in valid_clusters)
+    
+    gap_detected = False
+    u_gap_left = (u_start + u_end) / 2.0
+    u_gap_right = u_gap_left
+    
+    if K >= 2:
+        gap_widths = []
+        for k in range(K - 1):
+            w_k = valid_clusters[k + 1].u_min - valid_clusters[k].u_max
+            gap_widths.append(w_k)
+            
+        k_star = int(np.argmax(gap_widths))
+        w_star = gap_widths[k_star]
+        
+        if w_star >= gap_min_px:
+            u_gap_left = valid_clusters[k_star].u_max
+            u_gap_right = valid_clusters[k_star + 1].u_min
+            gap_detected = True
 
-    logger.info(
-        "Boundary localization: c_start*=%.2f  c_peak=%d  c_end*=%.2f",
-        c_start, c_peak, c_end,
+    logger.debug(
+        "Stage B.4/B.5/B.6: u_start=%.1f, u_end=%.1f, "
+        "gap=[%.1f, %.1f], gap_detected=%s, valid_clusters=%d.",
+        u_start, u_end, u_gap_left, u_gap_right, gap_detected, K
     )
 
-    # ── Step 4: Physically-scaled Hampel / MAD continuity filter ─────
-    window_columns = _compute_hampel_window(hardware_cfg, Z_ref, L_w_mm)
-    logger.info(
-        "Hampel window: %d columns (L_w=%.1f mm).", window_columns, L_w_mm
-    )
-
-    # Select points within the validated window
-    window_mask = (x_int >= int(np.floor(c_start))) & (x_int <= int(np.ceil(c_end)))
-    x_win = x_cols[window_mask]
-    y_win = y_vals[window_mask]
-
-    if len(y_win) > window_columns:
-        inlier_mask = _hampel_filter(y_win, window_columns, mad_k)
-        # Run-length gate: reject inlier runs shorter than window_columns
-        inlier_mask = _reject_short_runs(inlier_mask, min_run=window_columns)
-        x_bounded = x_win[inlier_mask]
-        y_bounded = y_win[inlier_mask]
-    else:
-        # Too few points for Hampel — keep all
-        x_bounded = x_win.copy()
-        y_bounded = y_win.copy()
-
-    if len(x_bounded) == 0:
-        logger.warning(
-            "Hampel filter removed all points — returning full window as fallback."
-        )
-        x_bounded = x_win.copy()
-        y_bounded = y_win.copy()
-
-    # ── Step 5: GTrFN confidence envelopes (diagnostic) ───────────────
-    env_start = build_gtrfn_envelope(Phi_smooth, c_start)
-    env_end   = build_gtrfn_envelope(Phi_smooth, c_end)
-
-    logger.info(
-        "Boundary truncation: %d → %d points (%.1f%% retained).",
-        M, len(x_bounded),
-        100.0 * len(x_bounded) / max(M, 1),
-    )
-
-    return x_bounded, y_bounded, c_start, c_end, env_start, env_end
+    return (u_start, u_end, u_gap_left, u_gap_right, gap_detected, K)
 
 
-# ============================================================
-# Private helpers
-# ============================================================
+# ======================================================================
+# Main entry point — Stage B orchestrator
+# ======================================================================
 
-def _compute_hampel_window(
-    hardware_cfg: Optional[HardwareConfig],
-    Z_ref: Optional[float],
-    L_w_mm: float,
-) -> int:
-    """Convert the physical Hampel window length to an odd integer column count.
+def localize_seam_boundaries_geometric(
+    u_raw: np.ndarray,
+    v_raw: np.ndarray,
+    v_lower: Optional[np.ndarray] = None,
+    v_upper: Optional[np.ndarray] = None,
+    *,
+    L_min: int = 10,
+    delta_plate: float = 4.0,
+    n_ransac: Optional[int] = None,
+    gap_min_px: float = 3.0,
+    intra_gap_px: float = 2.0,
+    span_min: float = 20.0,
+) -> BoundaryResult:
+    """Localize seam boundaries geometrically (RANSAC + jump-distance).
 
-    Uses the calibrated pixel pitch at the reference depth:
-
-        pixel_pitch_mm(Z) = (sensor_pixel_size_um * Z) / (focal_length_mm * 1000)
-        window_columns    = round(L_w_mm / pixel_pitch_mm(Z_ref))  [odd, ≥ 3]
-
-    Falls back to 7 columns (the original hard-coded value) if hardware
-    configuration is unavailable.
-    """
-    FALLBACK = 7
-    if hardware_cfg is None:
-        return FALLBACK
-
-    z = Z_ref if Z_ref is not None else getattr(
-        hardware_cfg, 'depth_confidence_z_ref_mm', 200.0
-    )
-    sensor_px_um = getattr(hardware_cfg, 'sensor_pixel_size_um', None)
-    focal_mm     = getattr(hardware_cfg, 'focal_length_mm', None)
-
-    if sensor_px_um is None or focal_mm is None or focal_mm < _EPS:
-        return FALLBACK
-
-    pixel_pitch_mm = (sensor_px_um * z) / (focal_mm * 1000.0)
-    if pixel_pitch_mm < _EPS:
-        return FALLBACK
-
-    w = int(round(L_w_mm / pixel_pitch_mm))
-    w = max(w, 3)
-    if w % 2 == 0:
-        w += 1
-    return w
-
-
-def _hampel_filter(
-    y: np.ndarray,
-    window: int,
-    k: float,
-) -> np.ndarray:
-    """Rolling Hampel / MAD inlier filter.
-
-    For each point i, the local median and MAD are computed over a window
-    centred at i.  Points with |y[i] - median| > k * MAD are flagged as
-    outliers.
+    Orchestrates Stages B.0 through B.7 as specified in the Stage B
+    algorithm document.  The truncation is *topology-preserving*: tail
+    points beyond the physical plate boundaries are removed, but all
+    points within the seam extent — including the weld gap — are
+    retained.
 
     Parameters
     ----------
-    y : np.ndarray
-        Y-centre values (1-D).
-    window : int
-        Odd rolling-window length.
-    k : float
-        Rejection multiplier (≈ 3, matching z_threshold convention).
+    u_raw : np.ndarray, shape (N,)
+        Sub-pixel column coordinates from Steger + EKM (``x_coords``
+        field of ``FuzzyResult``).  Need not be pre-sorted; sorting is
+        applied internally in Stage B.0.
+    v_raw : np.ndarray, shape (N,)
+        Corresponding fuzzy-enhanced row centers (``y_centers``).
+    v_lower : np.ndarray, shape (N,), optional
+        EKM left bounds (``y_lower`` field of ``FuzzyResult``).
+        Propagated through truncation for downstream uncertainty use.
+        When *None*, defaults to a copy of ``v_raw``.
+    v_upper : np.ndarray, shape (N,), optional
+        EKM right bounds (``y_upper`` field of ``FuzzyResult``).
+        When *None*, defaults to a copy of ``v_raw``.
+    L_min : int
+        Minimum contiguous run length for Stage B.1 pre-filter.
+    delta_plate : float
+        RANSAC inlier tolerance in pixels (Stage B.2).
+    n_ransac : int, optional
+        Override RANSAC iteration count (Stage B.2).
+    gap_min_px : float
+        Minimum gap width in pixels to declare a physical weld gap
+        (Stages B.3, B.4, B.5).
+    intra_gap_px : float
+        Column-spacing tolerance for treating consecutive points as
+        within the same run (Stage B.1).
 
     Returns
     -------
-    inlier_mask : np.ndarray, shape (len(y),), dtype bool
+    BoundaryResult
+        Complete boundary localization result.  See the dataclass
+        docstring for field descriptions.
+
+    Raises
+    ------
+    ValueError
+        If the input arrays are empty, inconsistently shaped, or if
+        RANSAC fails to find a geometric consensus.
     """
-    n = len(y)
-    inlier = np.ones(n, dtype=bool)
-    half = window // 2
+    # ── Stage B.0 — Sort and validate ─────────────────────────────────
+    u_raw = np.asarray(u_raw, dtype=np.float64).ravel()
+    v_raw = np.asarray(v_raw, dtype=np.float64).ravel()
 
-    for i in range(n):
-        lo = max(0, i - half)
-        hi = min(n, i + half + 1)
-        local = y[lo:hi]
-        med = float(np.median(local))
-        mad = float(np.median(np.abs(local - med)))
-        if mad < _EPS:
-            continue
-        if abs(float(y[i]) - med) > k * mad:
-            inlier[i] = False
+    N = len(u_raw)
+    if N == 0:
+        raise ValueError("Stage B: empty input arrays.")
+    if len(v_raw) != N:
+        raise ValueError(
+            f"Stage B: u_raw length {N} ≠ v_raw length {len(v_raw)}."
+        )
 
-    return inlier
+    # Default EKM bounds to the crisp center if not supplied
+    if v_lower is None:
+        v_lower = v_raw.copy()
+    else:
+        v_lower = np.asarray(v_lower, dtype=np.float64).ravel()
 
+    if v_upper is None:
+        v_upper = v_raw.copy()
+    else:
+        v_upper = np.asarray(v_upper, dtype=np.float64).ravel()
 
-def _reject_short_runs(
-    inlier_mask: np.ndarray,
-    min_run: int,
-) -> np.ndarray:
-    """Reject contiguous inlier runs shorter than *min_run* columns.
+    if len(v_lower) != N or len(v_upper) != N:
+        raise ValueError(
+            "Stage B: v_lower / v_upper must match u_raw length."
+        )
 
-    This implements the physical run-length gate described in §3.2.4:
-    even if individual points pass the Hampel test, a very short run of
-    inliers surrounded by outliers is likely a specular artefact rather
-    than a real plate segment.
+    # Sort all arrays by column coordinate
+    order = np.argsort(u_raw, kind='stable')
+    u  = u_raw[order]
+    v  = v_raw[order]
+    vl = v_lower[order]
+    vh = v_upper[order]
 
-    Parameters
-    ----------
-    inlier_mask : np.ndarray, dtype bool
-    min_run : int
-        Minimum inlier run length to keep.
+    if N < 4:
+        raise ValueError(
+            f"Stage B: need at least 4 points, got {N}."
+        )
 
-    Returns
-    -------
-    updated_mask : np.ndarray, dtype bool
-    """
-    result = inlier_mask.copy()
-    n = len(inlier_mask)
-    i = 0
-    while i < n:
-        if inlier_mask[i]:
-            # Find end of this run
-            j = i
-            while j < n and inlier_mask[j]:
-                j += 1
-            run_length = j - i
-            if run_length < min_run:
-                result[i:j] = False
-            i = j
-        else:
-            i += 1
-    return result
+    logger.info("Stage B.0: %d input points (sorted).", N)
+
+    # ── Stage B.1 — Minimum-density pre-filter ────────────────────────
+    u_f, v_f, vl_f, vh_f = filter_minimum_density(
+        u, v, vl, vh, L_min=L_min, intra_gap_px=intra_gap_px,
+    )
+    N_f = len(u_f)
+    logger.info("Stage B.1: %d points remain after density filter.", N_f)
+
+    if N_f < 4:
+        raise ValueError(
+            "Stage B.1: too few points remain after density filter. "
+            "Check L_min or the quality of Steger detection."
+        )
+
+    # ── Stage B.2 — RANSAC line fit ───────────────────────────────────
+    inlier_mask, m_star, b_star = ransac_line_fit(
+        u_f, v_f,
+        delta_plate=delta_plate,
+        n_ransac=n_ransac,
+    )
+
+    u_in  = u_f[inlier_mask]
+    v_in  = v_f[inlier_mask]
+    vl_in = vl_f[inlier_mask]
+    vh_in = vh_f[inlier_mask]
+    N_in  = len(u_in)
+
+    logger.info(
+        "Stage B.2: %d RANSAC inliers / %d filtered points  "
+        "(line m=%.4f, b=%.4f).",
+        N_in, N_f, m_star, b_star,
+    )
+
+    if N_in < 4:
+        raise ValueError(
+            f"Stage B.2: RANSAC inlier count ({N_in}) too small for "
+            "reliable clustering."
+        )
+
+    # ── Stage B.3 — Jump-distance clustering ──────────────────────────
+    clusters = jump_distance_clustering(u_in, gap_min_px=gap_min_px)
+    logger.info("Stage B.3: %d clusters found.", len(clusters))
+
+    if len(clusters) == 0:
+        raise ValueError("Stage B.3: no clusters found in inlier set.")
+
+    # ── Stage B.4/B.5/B.6 — Select valid clusters and derive global bounds ───────────
+    (u_start, u_end,
+     u_gap_left, u_gap_right,
+     gap_detected, K) = find_global_extent_and_gap(clusters, span_min=span_min, gap_min_px=gap_min_px)
+
+    logger.info(
+        "Stage B.4/B.5/B.6: u_start=%.1f, u_end=%.1f, "
+        "gap=[%.1f, %.1f], gap_detected=%s.",
+        u_start, u_end, u_gap_left, u_gap_right, gap_detected,
+    )
+
+    # ── Stage B.6 — Topology-preserving truncation ────────────────────
+    # Apply the physical bounds to the FULL sorted raw array (not just
+    # the filtered/inlier subset) to preserve all points in the gap
+    # region, even if they were marked as RANSAC outliers.  Weak
+    # detections inside the gap are geometrically valid (gap-floor
+    # scatter) and must not be discarded.
+
+    bound_mask = (u >= u_start) & (u <= u_end)
+
+    u_bounded  = u[bound_mask]
+    v_bounded  = v[bound_mask]
+    vl_bounded = vl[bound_mask]
+    vh_bounded = vh[bound_mask]
+
+    M = len(u_bounded)
+    if M == 0:
+        raise ValueError(
+            "Stage B.6: no points remain in the truncation window "
+            f"[{u_start:.1f}, {u_end:.1f}]. "
+            "Check plate-cluster selection."
+        )
+
+    # ── Stage B.7 — Gap topology annotation ───────────────────────────
+    in_gap_mask = (u_bounded >= u_gap_left) & (u_bounded <= u_gap_right)
+
+    logger.info(
+        "Stage B.7: %d / %d raw points retained (%.1f%%), "
+        "%d in weld gap.",
+        M, N, 100.0 * M / N, int(np.sum(in_gap_mask)),
+    )
+
+    return BoundaryResult(
+        u_bounded    = u_bounded,
+        v_bounded    = v_bounded,
+        v_lo_bounded = vl_bounded,
+        v_hi_bounded = vh_bounded,
+        in_gap_mask  = in_gap_mask,
+        u_start      = u_start,
+        u_end        = u_end,
+        gap_interval = (u_gap_left, u_gap_right),
+        gap_detected = gap_detected,
+        ransac_line  = (m_star, b_star),
+        n_inliers    = N_in,
+        n_valid_clusters = K,
+    )
